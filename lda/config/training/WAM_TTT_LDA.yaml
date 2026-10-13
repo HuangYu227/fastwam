@@ -1,0 +1,107 @@
+run_id: wam_ttt_lda
+run_root_dir: results/WAM-TTT
+seed: 42
+is_debug: false
+
+framework:
+  name: QwenMMDiT
+  qwenvl:
+    base_vlm: Qwen/Qwen3-VL-4B-Instruct
+  action_model:
+    action_model_type: DiT-L
+    hidden_size: 2560
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 138
+    state_dim: null
+    max_num_embodiments: 32
+    future_action_window_size: 15
+    action_horizon: 16
+    past_action_window_size: 0
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    vision_encoder_type: dinov3
+    vision_encoder_size: s
+    vision_encoder_path: /path/to/pretrained/dinov3
+    obs_horizon: 2
+    num_views: 1
+    future_obs_index: 5
+    only_policy: false
+    policy_and_video_gen: false
+    only_wo_video_gen: false
+    obs_loss_weight: 1.0
+    diffusion_model_cfg:
+      num_layers: 16
+      num_attention_heads: 32
+      attention_head_dim: 48
+      output_dim: 1536
+      cross_attention_dim: 2560
+      dropout: 0.0
+      final_dropout: false
+      positional_embeddings: null
+      wam_ttt_enabled: true
+      wam_ttt_dim: 48
+      wam_ttt_hidden_dim: 128
+      gradient_checkpointing: true
+
+wam_ttt:
+  inner_steps: 1
+  meta_learning_rate: 0.1
+  test_learning_rate: 0.01
+  kv_loss_weight: 0.04
+
+datasets:
+  vla_data:
+    data_root_dir: /path/to/paired/lerobot/data
+    video_backend: decord
+    use_delta_action: false
+    include_state: false
+    default_image_resolution: [3, 224, 224]
+    image_size: [224, 224]
+    delete_pause_frame: false
+    sequential_step_sampling: true
+  wam_ttt:
+    # Put robot and human datasets in the same mixture. Pairing uses normalized
+    # language labels and the closest episode_phase. Dataset names are relative
+    # to data_root_dir and robot_type must exist in LDA's data_config map.
+    mixture:
+      - name: RobotData/paired_robot_lerobot
+        robot_type: ur
+        weight: 1.0
+      - name: HumanData/paired_human_video
+        robot_type: taste_rob
+        weight: 1.0
+    inner_batch_size: 4
+    outer_batch_size: 16
+    outer_tasks: [policy, forward_dynamics, inverse_dynamics]
+    pair_retry_batches: 32
+    num_workers: 8
+    balance_dataset_weights: false
+    balance_trajectory_weights: false
+
+trainer:
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  learning_rate:
+    base: 1.0e-5
+    qwen_vl_interface: 1.0e-5
+    action_model: 1.0e-4
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-7
+  freeze_modules: ""
+  pretrained_checkpoint: null
+  resume_from: null
+  optimizer:
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 1.0e-8

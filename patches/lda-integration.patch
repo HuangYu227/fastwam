@@ -1,0 +1,360 @@
+diff --git a/lda/dataloader/gr00t_lerobot/datasets.py b/lda/dataloader/gr00t_lerobot/datasets.py
+index f78cb7d..4a06b07 100644
+--- a/lda/dataloader/gr00t_lerobot/datasets.py
++++ b/lda/dataloader/gr00t_lerobot/datasets.py
+@@ -2305,6 +2305,8 @@ class LeRobotMixtureDataset(Dataset):
+ 
+                 # Get language and action data
+                 language = data[dataset.modality_keys["language"][0]][0]
++                episode_phase = float(step / max(int(dataset.trajectory_lengths[trajectory_id]) - 1, 1))
++                pair_key = " ".join(str(language).casefold().split())
+                 history_action = None
+                 if dataset.history_action_indices is not None:
+                     if 'action' in dataset.modality_keys.keys():
+@@ -2377,10 +2379,12 @@ class LeRobotMixtureDataset(Dataset):
+                         state = np.zeros((1, 1), dtype=np.float32)
+                     # prim_images
+                     return dict(action=action, history_action=history_action, action_mask=action_mask, image=all_images, 
+-                    future_image=future_all_images, lang=language, state=state, embodiment_id=embodiment_tag, assigned_task=assigned_task)
++                    future_image=future_all_images, lang=language, state=state, embodiment_id=embodiment_tag, assigned_task=assigned_task,
++                    pair_key=pair_key, episode_phase=episode_phase)
+ 
+                 return dict(action=action, history_action=history_action, action_mask=action_mask, image=all_images, future_image=future_all_images, 
+-                    lang=language, embodiment_id=embodiment_tag, assigned_task=assigned_task)
++                    lang=language, embodiment_id=embodiment_tag, assigned_task=assigned_task,
++                    pair_key=pair_key, episode_phase=episode_phase)
+                 
+             except Exception as e:
+                 last_exception = e
+diff --git a/lda/model/framework/QwenMMDiT.py b/lda/model/framework/QwenMMDiT.py
+index 1e34598..5c685d6 100644
+--- a/lda/model/framework/QwenMMDiT.py
++++ b/lda/model/framework/QwenMMDiT.py
+@@ -31,6 +31,7 @@ IGNORE_INDEX = -100
+ from lda.model.framework.base_framework import baseframework
+ from lda.model.modules.vlm import get_vlm_model
+ from lda.model.modules.action_model.MMDiT_ActionHeader import get_action_model, FlowmatchingActionHead
++from lda.model.modules.action_model.wam_ttt import FastWeightStates
+ from lda.training.trainer_utils.trainer_tools import resize_images
+ from lda.model.tools import FRAMEWORK_REGISTRY
+ 
+@@ -76,6 +77,8 @@ class Qwen_MMDiT(baseframework):
+     def forward(
+         self,
+         examples: List[dict] = None,
++        ttt_fast_weights: Optional[FastWeightStates] = None,
++        return_ttt_inputs: bool = False,
+         **kwargs,
+     ) -> Tuple:
+         """
+@@ -178,7 +181,9 @@ class Qwen_MMDiT(baseframework):
+                 curr_imgs=curr_images_repeated, 
+                 embodiment_id=embodiment_ids_repeated, 
+                 assigned_tasks=tasks, 
+-                encoder_attention_mask=attention_mask_repeated)  # (B, chunk_len, action_dim)
++                encoder_attention_mask=attention_mask_repeated,
++                ttt_fast_weights=ttt_fast_weights,
++                return_ttt_inputs=return_ttt_inputs)  # (B, chunk_len, action_dim)
+ 
+         return output_dict
+ 
+@@ -186,6 +191,7 @@ class Qwen_MMDiT(baseframework):
+     def predict_action(
+         self,
+         examples: List[dict],
++        ttt_fast_weights: Optional[FastWeightStates] = None,
+         **kwargs: str,
+     ) -> np.ndarray:
+         """
+@@ -260,7 +266,10 @@ class Qwen_MMDiT(baseframework):
+         attention_mask = attention_mask.to(last_hidden.device, dtype=last_hidden.dtype)
+         # Step 4: Action Expert Forward and Loss
+         with torch.autocast("cuda", dtype=torch.float32):
+-            pred_actions = self.action_model.predict_action(last_hidden, state, history_actions, curr_imgs, embodiment_ids, attention_mask)  # (B, chunk_len, action_dim)
++            pred_actions = self.action_model.predict_action(
++                last_hidden, state, history_actions, curr_imgs, embodiment_ids, attention_mask,
++                ttt_fast_weights=ttt_fast_weights,
++            )  # (B, chunk_len, action_dim)
+ 
+         normalized_actions = pred_actions.detach().cpu().float().numpy()
+         return {"normalized_actions": normalized_actions}
+diff --git a/lda/model/modules/action_model/MMDiT_ActionHeader.py b/lda/model/modules/action_model/MMDiT_ActionHeader.py
+index ce94b3e..dc3f3e2 100644
+--- a/lda/model/modules/action_model/MMDiT_ActionHeader.py
++++ b/lda/model/modules/action_model/MMDiT_ActionHeader.py
+@@ -19,7 +19,7 @@ from transformers.feature_extraction_utils import BatchFeature
+ from transformers import AutoModel, AutoImageProcessor, AutoVideoProcessor
+ from einops import rearrange
+ import time
+-from typing import List
++from typing import List, Optional
+ 
+ from lda.model.modules.action_model.flow_matching_head.action_encoder import (
+     SinusoidalPositionalEncoding,
+@@ -27,6 +27,7 @@ from lda.model.modules.action_model.flow_matching_head.action_encoder import (
+ )
+ 
+ from lda.model.modules.action_model.flow_matching_head.mmdit.mmdit.mmdit_cross_attn import MMDiT as DiT
++from lda.model.modules.action_model.wam_ttt import FastWeightStates
+ from lda.model.modules.dinov3_vit import DINOv3ViTModel
+ from lda.model.modules.action_model.UWM.transforms import VAEDownsample, VideoTransform
+ 
+@@ -375,7 +376,6 @@ class FlowmatchingActionHead(nn.Module):
+         self.only_policy = config.only_policy
+         self.policy_and_video_gen = config.policy_and_video_gen
+         self.only_wo_video_gen = config.only_wo_video_gen
+-
+         self.multi_embodiment = config.max_num_embodiments > 1
+         if config.max_num_embodiments > 1:
+             self.state_encoder = CategorySpecificMLP(
+@@ -583,6 +583,8 @@ class FlowmatchingActionHead(nn.Module):
+         embodiment_id: torch.Tensor = None,
+         assigned_tasks: List[str] = None,  
+         encoder_attention_mask: torch.Tensor = None,
++        ttt_fast_weights: Optional[FastWeightStates] = None,
++        return_ttt_inputs: bool = False,
+     ):
+         """
+         Args:
+@@ -791,7 +793,7 @@ class FlowmatchingActionHead(nn.Module):
+             action_features_pos_embs = self.position_embedding(action_features_pos_ids).unsqueeze(0)
+             action_features = action_features + action_features_pos_embs
+         # === 7. 模型前向 ===
+-        image_tokens, action_tokens = self.model(
++        model_outputs = self.model(
+             image_tokens=obs_tokens,
+             action_tokens=action_features,
+             text_tokens=vl_embs,
+@@ -799,7 +801,13 @@ class FlowmatchingActionHead(nn.Module):
+             text_mask = encoder_attention_mask,
+             time_cond = diffusion_t,
+             task_embedding = task_embedding,
++            ttt_fast_weights=ttt_fast_weights,
++            return_ttt_inputs=return_ttt_inputs,
+         )
++        if return_ttt_inputs:
++            image_tokens, action_tokens, ttt_inputs = model_outputs
++        else:
++            image_tokens, action_tokens = model_outputs
+         # === 8. 解码输出 ===
+         if self.multi_embodiment:
+             pred_actions = self.action_decoder(action_tokens, embodiment_id)
+@@ -809,9 +817,14 @@ class FlowmatchingActionHead(nn.Module):
+         
+         # === 9. 计算 per-sample loss ===
+         total_loss = 0.0
+-        policy_pred_actions = pred_actions[:len(policy_indices)]
+-        policy_act_loss = F.mse_loss(policy_pred_actions, action_velocity[:len(policy_indices)], reduction="none") * action_mask[policy_indices]
+-        policy_act_loss = policy_act_loss.sum() / (action_mask[policy_indices].sum() + 1e-8)
++        if policy_indices:
++            policy_pred_actions = pred_actions[:len(policy_indices)]
++            policy_act_loss = F.mse_loss(policy_pred_actions, action_velocity[:len(policy_indices)], reduction="none") * action_mask[policy_indices]
++            policy_act_loss = policy_act_loss.sum() / (action_mask[policy_indices].sum() + 1e-8)
++        else:
++            # A human-only inner batch has no action labels; keep the loss
++            # connected to the graph while contributing exactly zero.
++            policy_act_loss = pred_actions.sum() * 0.0
+         total_loss += policy_act_loss
+         obs_loss = torch.tensor(0)
+         if self.policy_and_video_gen:
+@@ -819,26 +832,35 @@ class FlowmatchingActionHead(nn.Module):
+             obs_loss = F.mse_loss(pred_next_obs, obs_velocity[-len(video_gen_indices):])
+             total_loss += obs_loss
+         elif self.only_wo_video_gen:
+-            inverse_pred_actions = pred_actions[len(policy_indices):len(pred_action_task_indices), :self.future_obs_index]
+-            inverse_act_loss = F.mse_loss(inverse_pred_actions, action_velocity[len(policy_indices):, :self.future_obs_index], reduction="none") * action_mask[inverse_dynamics_indices, :self.future_obs_index]
+-            inverse_act_loss = inverse_act_loss.sum() / (action_mask[inverse_dynamics_indices, :self.future_obs_index].sum() + 1e-8)
++            if inverse_dynamics_indices:
++                inverse_pred_actions = pred_actions[len(policy_indices):len(pred_action_task_indices), :self.future_obs_index]
++                inverse_act_loss = F.mse_loss(inverse_pred_actions, action_velocity[len(policy_indices):, :self.future_obs_index], reduction="none") * action_mask[inverse_dynamics_indices, :self.future_obs_index]
++                inverse_act_loss = inverse_act_loss.sum() / (action_mask[inverse_dynamics_indices, :self.future_obs_index].sum() + 1e-8)
++            else:
++                inverse_act_loss = pred_actions.sum() * 0.0
+             total_loss += inverse_act_loss
+             pred_next_obs = self.get_next_obs_tokens(image_tokens, pred_next_obs_task_indices)
+             obs_loss = F.mse_loss(pred_next_obs[:len(forward_dynamics_indices)], obs_velocity[:len(forward_dynamics_indices)])
+             total_loss += obs_loss
+         elif not self.only_policy:
+-            inverse_pred_actions = pred_actions[len(policy_indices):len(pred_action_task_indices), :self.future_obs_index]
+-            inverse_act_loss = F.mse_loss(inverse_pred_actions, action_velocity[len(policy_indices):, :self.future_obs_index], reduction="none") * action_mask[inverse_dynamics_indices, :self.future_obs_index]
+-            inverse_act_loss = inverse_act_loss.sum() / (action_mask[inverse_dynamics_indices, :self.future_obs_index].sum() + 1e-8)
++            if inverse_dynamics_indices:
++                inverse_pred_actions = pred_actions[len(policy_indices):len(pred_action_task_indices), :self.future_obs_index]
++                inverse_act_loss = F.mse_loss(pred_actions[len(policy_indices):len(pred_action_task_indices), :self.future_obs_index], action_velocity[len(policy_indices):, :self.future_obs_index], reduction="none") * action_mask[inverse_dynamics_indices, :self.future_obs_index]
++                inverse_act_loss = inverse_act_loss.sum() / (action_mask[inverse_dynamics_indices, :self.future_obs_index].sum() + 1e-8)
++            else:
++                inverse_act_loss = pred_actions.sum() * 0.0
+             total_loss += inverse_act_loss
+             pred_next_obs = self.get_next_obs_tokens(image_tokens, pred_next_obs_task_indices)
+             obs_loss = F.mse_loss(pred_next_obs, obs_velocity)
+             total_loss += obs_loss
+-        return BatchFeature(data={
++        output = {
+             "loss": total_loss,
+             "action_loss": policy_act_loss.detach(),
+             "dynamics_loss": obs_loss.detach(),
+-        })
++        }
++        if return_ttt_inputs:
++            output["ttt_inputs"] = ttt_inputs
++        return BatchFeature(data=output)
+ 
+     @torch.no_grad()
+     def predict_action(
+@@ -849,6 +871,7 @@ class FlowmatchingActionHead(nn.Module):
+         curr_imgs: torch.Tensor = None,
+         embodiment_id: torch.Tensor = None,
+         attention_mask: torch.Tensor = None,
++        ttt_fast_weights: Optional[FastWeightStates] = None,
+     ) -> torch.Tensor:
+         """
+         Denoising diffusion sampling for action prediction (policy task only).
+@@ -946,6 +969,7 @@ class FlowmatchingActionHead(nn.Module):
+                 text_mask = attention_mask,
+                 time_cond = timesteps,
+                 task_embedding = task_embedding,
++                ttt_fast_weights=ttt_fast_weights,
+             )
+ 
+             # === 5.7 Extract and decode action velocity ===
+diff --git a/lda/model/modules/action_model/flow_matching_head/mmdit/mmdit/mmdit_cross_attn.py b/lda/model/modules/action_model/flow_matching_head/mmdit/mmdit/mmdit_cross_attn.py
+index 67ed94a..7c834b3 100644
+--- a/lda/model/modules/action_model/flow_matching_head/mmdit/mmdit/mmdit_cross_attn.py
++++ b/lda/model/modules/action_model/flow_matching_head/mmdit/mmdit/mmdit_cross_attn.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ from typing import Tuple, Optional
+ 
+ import torch
++import torch.utils.checkpoint
+ from torch import nn
+ from torch import Tensor
+ import torch.nn.functional as F
+@@ -26,6 +27,7 @@ from diffusers.models.embeddings import SinusoidalPositionalEmbedding
+ from lda.model.modules.action_model.flow_matching_head.cdit import TimestepEncoder
+ from lda.model.modules.action_model.flow_matching_head.mmdit.mmdit.mmdit_self_attn import JointAttention
+ from lda.model.modules.action_model.flow_matching_head.mmdit.mmdit.rope_3d import Rotary3D, Rotary1D
++from ....wam_ttt import FastWeightStates, TTTMemoryBank
+ # helpers
+ 
+ def exists(v):
+@@ -340,6 +342,10 @@ class MMDiT(ModelMixin, ConfigMixin):
+         cross_attention_dim: Optional[int] = None,
+         final_norm = True,
+         num_residual_streams = 1,
++        wam_ttt_enabled: bool = False,
++        wam_ttt_dim: int = 48,
++        wam_ttt_hidden_dim: int = 128,
++        gradient_checkpointing: bool = False,
+         **kwargs
+     ):
+         super().__init__()
+@@ -374,6 +380,18 @@ class MMDiT(ModelMixin, ConfigMixin):
+ 
+             self.blocks.append(block)
+ 
++        self.ttt_memory = (
++            TTTMemoryBank(
++                num_layers=num_layers,
++                model_dim=self.inner_dim,
++                memory_dim=wam_ttt_dim,
++                hidden_dim=wam_ttt_hidden_dim,
++            )
++            if wam_ttt_enabled
++            else None
++        )
++        self.gradient_checkpointing = gradient_checkpointing
++
+         self.norm = RMSNorm(self.inner_dim) if final_norm else nn.Identity()
+         self.action_norm = RMSNorm(self.inner_dim) if final_norm else nn.Identity()
+ 
+@@ -395,8 +413,16 @@ class MMDiT(ModelMixin, ConfigMixin):
+         text_mask = None,
+         time_cond = None,
+         task_embedding = None,
++        ttt_fast_weights: Optional[FastWeightStates] = None,
++        return_ttt_inputs: bool = False,
+     ):
+ 
++        if (ttt_fast_weights is not None or return_ttt_inputs) and self.ttt_memory is None:
++            raise ValueError("WAM-TTT inputs require wam_ttt_enabled=True")
++        if ttt_fast_weights is not None and len(ttt_fast_weights) != len(self.blocks):
++            raise ValueError("ttt_fast_weights must contain one state per MMDiT block")
++
++        register_count = register_tokens.shape[1] if register_tokens is not None else 0
+         if register_tokens is not None:
+             image_tokens, packed_shape = pack([register_tokens, image_tokens], 'b * d')
+         image_tokens = self.expand_streams(image_tokens)
+@@ -409,15 +435,50 @@ class MMDiT(ModelMixin, ConfigMixin):
+             if task_embedding is not None:
+                 time_cond += task_embedding
+ 
++        ttt_inputs = []
+         for ind, block in enumerate(self.blocks):
+ 
+-            text_tokens, image_tokens, action_tokens = block(
+-                time_cond = time_cond,
+-                text_tokens = text_tokens,
+-                image_tokens = image_tokens,
+-                action_tokens = action_tokens,
+-                text_mask = text_mask,
+-            )
++            memory_input = None
++            if self.ttt_memory is not None:
++                memory_input = image_tokens[:, register_count:] if register_count else image_tokens
++                if return_ttt_inputs:
++                    ttt_inputs.append(memory_input)
++
++            if self.gradient_checkpointing and self.training:
++                def run_block(text, image, action, _block=block):
++                    return _block(
++                        time_cond=time_cond,
++                        text_tokens=text,
++                        image_tokens=image,
++                        action_tokens=action,
++                        text_mask=text_mask,
++                    )
++
++                text_tokens, image_tokens, action_tokens = torch.utils.checkpoint.checkpoint(
++                    run_block,
++                    text_tokens,
++                    image_tokens,
++                    action_tokens,
++                    use_reentrant=False,
++                )
++            else:
++                text_tokens, image_tokens, action_tokens = block(
++                    time_cond=time_cond,
++                    text_tokens=text_tokens,
++                    image_tokens=image_tokens,
++                    action_tokens=action_tokens,
++                    text_mask=text_mask,
++                )
++
++            if ttt_fast_weights is not None:
++                memory_residual = self.ttt_memory.read(ind, memory_input, ttt_fast_weights[ind])
++                if register_count:
++                    image_tokens = torch.cat(
++                        [image_tokens[:, :register_count], image_tokens[:, register_count:] + memory_residual],
++                        dim=1,
++                    )
++                else:
++                    image_tokens = image_tokens + memory_residual
+         if register_tokens is not None:
+             _, image_tokens = unpack(image_tokens, packed_shape, 'b * d')
+ 
+@@ -431,6 +492,8 @@ class MMDiT(ModelMixin, ConfigMixin):
+         action_tokens = self.action_proj_out(action_tokens)
+         image_tokens = self.image_proj_out(image_tokens)
+ 
++        if return_ttt_inputs:
++            return image_tokens, action_tokens, tuple(ttt_inputs)
+         return image_tokens, action_tokens
+ 
+ def test_mmdit():
+@@ -486,4 +549,4 @@ def test_mmdit():
+     assert not torch.isnan(action_out).any()
+ 
+ if __name__ == "__main__":
+-    test_mmdit()
+\ No newline at end of file
++    test_mmdit()

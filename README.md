@@ -29,4 +29,4 @@ Set `NUM_PROCESSES` to the GPU count for distributed training. The default WAM-T
 
 At test time, call `WAMTTTMetaLearner.adapt_from_human(human_examples)` to obtain episode-specific fast weights, then pass them to `model.predict_action(robot_examples, ttt_fast_weights=fast_weights)`.
 
-The paper's paired datasets, pretrained weights, and robot evaluation setup are not included. This is an implementation for compatible data, not a claim that the paper's reported experiments have been reproduced.
+The paper's paired datasets, pretrained weights, and robot evaluation setup are not included. The current loader matches examples by task text and nearest episode phase within sampled batches; it does not prove that two examples come from the same recorded human-robot episode. Reproducing the paper's exact paired-episode protocol requires the original episode correspondence metadata. The included CPU tests verify memory updates, meta-gradient flow, phase selection, and test-time parameter isolation; a full LDA training run remains unverified without the model dependencies, checkpoints, and data.

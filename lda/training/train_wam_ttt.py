@@ -27,10 +27,17 @@ def build_task_loaders(cfg):
     """Build separate video-only inner and robot-task outer loaders."""
     data_cfg = cfg.datasets.vla_data
     entries = cfg.datasets.wam_ttt.mixture
+    data_root = Path(data_cfg.data_root_dir).expanduser()
+    if not data_root.is_dir():
+        raise FileNotFoundError(f"LeRobot data root does not exist: {data_root}")
+    for item in entries:
+        dataset_path = data_root / item.name
+        if not dataset_path.is_dir():
+            raise FileNotFoundError(f"Configured LeRobot dataset does not exist: {dataset_path}")
     data_mixture = [
         (
             make_LeRobotSingleDataset(
-                Path(data_cfg.data_root_dir),
+                data_root,
                 item.name,
                 item.robot_type,
                 delete_pause_frame=bool(data_cfg.get("delete_pause_frame", False)),
@@ -52,6 +59,10 @@ def build_task_loaders(cfg):
         state_dim=cfg.framework.action_model.get("state_dim"),
         action_dim=int(cfg.framework.action_model.action_dim),
     )
+    required_tasks = {"video_gen", *cfg.datasets.wam_ttt.outer_tasks}
+    missing_tasks = required_tasks - set(dataset.task_to_dataset_indices)
+    if missing_tasks:
+        raise ValueError(f"Configured datasets do not support required tasks: {sorted(missing_tasks)}")
 
     inner_batch_size = int(cfg.datasets.wam_ttt.inner_batch_size)
     outer_batch_size = int(cfg.datasets.wam_ttt.outer_batch_size)
@@ -75,6 +86,8 @@ def build_task_loaders(cfg):
     workers = int(cfg.datasets.wam_ttt.num_workers)
     human_loader = DataLoader(dataset, batch_sampler=human_sampler, collate_fn=collate_fn, num_workers=workers)
     robot_loader = DataLoader(dataset, batch_sampler=robot_sampler, collate_fn=collate_fn, num_workers=workers)
+    if not human_loader or not robot_loader:
+        raise ValueError("Dataset is too small for the configured batch sizes and distributed world size")
     return human_loader, robot_loader
 
 
@@ -94,6 +107,9 @@ def main(cfg) -> None:
     precision = str(cfg.trainer.mixed_precision)
     if precision not in {"bf16", "no"}:
         raise ValueError("Manual WAM-TTT gradient synchronization currently supports bf16 or no autocast, not fp16")
+    data_root = Path(cfg.datasets.vla_data.data_root_dir).expanduser()
+    if not data_root.is_dir():
+        raise FileNotFoundError(f"LeRobot data root does not exist: {data_root}")
     cfg.output_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
